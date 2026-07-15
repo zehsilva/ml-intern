@@ -274,3 +274,17 @@ def test_gemini_and_vertex_params_are_native_litellm_routes():
     assert _resolve_llm_params("vertex_ai/gemini-2.5-pro", "hf-token") == {
         "model": "vertex_ai/gemini-2.5-pro"
     }
+
+
+def test_direct_provider_auth_error_message_does_not_mention_hf_token():
+    from agent.core.agent_loop import _friendly_error_message
+
+    message = _friendly_error_message(
+        RuntimeError("AuthenticationError: unauthorized"),
+        model_id="openai/responses/gpt-5.6",
+    )
+
+    assert message is not None
+    assert "OPENAI_API_KEY" in message
+    assert "does not use HF_TOKEN" in message
+    assert "hf auth login" not in message

@@ -645,6 +645,7 @@ def _friendly_error_message(
     error: Exception,
     *,
     user_plan: str | None = None,
+    model_id: str | None = None,
 ) -> str | None:
     """Return a user-friendly message for known error types, or None to fall back to traceback."""
     err_str = str(error).lower()
@@ -654,6 +655,28 @@ def _friendly_error_message(
         or "unauthorized" in err_str
         or "invalid x-api-key" in err_str
     ):
+        if model_id:
+            try:
+                route = resolve_model_route(model_id)
+            except ValueError:
+                route = None
+            if route and not route.requires_hf_token:
+                env_by_provider = {
+                    "openai": "OPENAI_API_KEY",
+                    "openrouter": "OPENROUTER_API_KEY",
+                    "moonshot": "MOONSHOT_API_KEY",
+                    "gemini": "GEMINI_API_KEY",
+                    "vertex_ai": "Google Application Default Credentials or Vertex AI environment",
+                }
+                credential = env_by_provider.get(
+                    route.provider.value, "the provider API key"
+                )
+                return (
+                    f"Authentication failed for {route.provider.value} model '{model_id}'.\n\n"
+                    f"Set {credential} for this direct provider, or switch models with /model.\n"
+                    "This direct-provider route does not use HF_TOKEN or the Hugging Face Router."
+                )
+
         return (
             "Authentication failed - your Hugging Face token is missing or invalid.\n\n"
             "To fix this, set HF_TOKEN=hf_... or run `hf auth login`.\n\n"
@@ -921,6 +944,34 @@ async def _maybe_heal_invalid_thinking_signature(
     return True
 
 
+def _content_to_text(content: Any) -> str | None:
+    """Flatten provider-native content blocks into displayable assistant text."""
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return content or None
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                elif block.get("type") in {"thinking", "redacted_thinking"}:
+                    continue
+                else:
+                    parts.append(json.dumps(block, default=str))
+            else:
+                text = getattr(block, "text", None)
+                if isinstance(text, str):
+                    parts.append(text)
+                else:
+                    parts.append(str(block))
+        text = "\n".join(part for part in parts if part)
+        return text or None
+    return str(content)
+
+
 def _reasoning_from_message(message: Any) -> str | None:
     value = getattr(message, "reasoning_content", None)
     if value:
@@ -1021,12 +1072,13 @@ async def _call_llm_streaming(
                 if delta_reasoning:
                     reasoning_content += delta_reasoning
 
-                if delta.content:
-                    full_content += delta.content
+                delta_text = _content_to_text(getattr(delta, "content", None))
+                if delta_text:
+                    full_content += delta_text
                     await session.send_event(
                         Event(
                             event_type="assistant_chunk",
-                            data={"content": delta.content},
+                            data={"content": delta_text},
                         )
                     )
 
@@ -1237,7 +1289,7 @@ async def _call_llm_non_streaming(
 
     choice = response.choices[0]
     message = choice.message
-    content = message.content or None
+    content = _content_to_text(message.content)
     reasoning_content = _reasoning_from_message(message)
     finish_reason = choice.finish_reason
     token_count = response.usage.total_tokens if response.usage else 0
@@ -1958,6 +2010,7 @@ class Handlers:
                 error_msg = _friendly_error_message(
                     e,
                     user_plan=getattr(session, "user_plan", None),
+                    model_id=session.config.model_name,
                 )
                 if error_msg is None:
                     error_msg = str(e) + "\n" + traceback.format_exc()

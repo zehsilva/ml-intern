@@ -371,17 +371,20 @@ async def generate_title(
 ) -> dict:
     """Generate a short title for a chat session based on the first user message.
 
-    Always uses gpt-oss-120b via Cerebras on the HF router. The tab headline
-    renders as plain text, so the model is told to avoid markdown and any
-    stray formatting characters are stripped before returning. gpt-oss is a
-    reasoning model — reasoning_effort=low keeps the reasoning budget small
-    so the 60-token output budget isn't consumed before the title is written.
+    Uses the configured title model, falling back to the session manager's main
+    model. The tab headline renders as plain text, so the model is told to avoid
+    markdown and any stray formatting characters are stripped before returning.
     """
     try:
         await _check_session_access(request.session_id, user)
+        title_model = (
+            getattr(session_manager.config, "title_model_name", None)
+            or session_manager.config.model_name
+        )
+        route = resolve_model_route(title_model)
         llm_params = _resolve_llm_params(
-            "openai/gpt-oss-120b:cerebras",
-            _user_hf_token(user),
+            title_model,
+            _user_hf_token(user) if route.requires_hf_token else None,
             reasoning_effort="low",
         )
         llm_params = with_prompt_cache_params(llm_params)
