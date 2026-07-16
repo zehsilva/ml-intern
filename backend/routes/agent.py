@@ -53,7 +53,6 @@ from session_manager import (
 
 from agent.core.hf_access import get_jobs_access
 from agent.core.hf_tokens import resolve_hf_request_token
-from agent.core.local_models import local_model_provider
 from agent.core.llm_params import _resolve_llm_params
 from agent.core.model_ids import (
     CLAUDE_OPUS_48_MODEL_ID,
@@ -62,8 +61,8 @@ from agent.core.model_ids import (
     GPT_55_MODEL_ID,
     KIMI_K27_CODE_MODEL_ID,
     MINIMAX_M3_MODEL_ID,
-    strip_huggingface_model_prefix,
 )
+from agent.core.model_routing import resolve_model_route
 from agent.core.prompt_caching import with_prompt_cache_params
 from usage import build_usage_response
 
@@ -155,9 +154,12 @@ def _valid_model_ids() -> set[str]:
 
 
 def _validate_model_id(model_id: str | None) -> None:
-    if not model_id or model_id in _valid_model_ids():
+    if not model_id:
         return
-    raise HTTPException(status_code=400, detail=f"Unknown model: {model_id}")
+    try:
+        resolve_model_route(model_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Unknown model: {model_id}") from e
 
 
 def _default_model() -> str:
@@ -179,8 +181,12 @@ def _user_hf_token(user: dict[str, Any] | None) -> str | None:
 
 
 def _model_requires_hf_router_token(model_id: str | None) -> bool:
-    normalized = strip_huggingface_model_prefix(model_id) or model_id or ""
-    return local_model_provider(normalized) is None
+    if not model_id:
+        return False
+    try:
+        return resolve_model_route(model_id).requires_hf_token
+    except ValueError:
+        return False
 
 
 def _reject_oversize_dataset_upload(request: Request) -> None:
@@ -365,17 +371,20 @@ async def generate_title(
 ) -> dict:
     """Generate a short title for a chat session based on the first user message.
 
-    Always uses gpt-oss-120b via Cerebras on the HF router. The tab headline
-    renders as plain text, so the model is told to avoid markdown and any
-    stray formatting characters are stripped before returning. gpt-oss is a
-    reasoning model — reasoning_effort=low keeps the reasoning budget small
-    so the 60-token output budget isn't consumed before the title is written.
+    Uses the configured title model, falling back to the session manager's main
+    model. The tab headline renders as plain text, so the model is told to avoid
+    markdown and any stray formatting characters are stripped before returning.
     """
     try:
         await _check_session_access(request.session_id, user)
+        title_model = (
+            getattr(session_manager.config, "title_model_name", None)
+            or session_manager.config.model_name
+        )
+        route = resolve_model_route(title_model)
         llm_params = _resolve_llm_params(
-            "openai/gpt-oss-120b:cerebras",
-            _user_hf_token(user),
+            title_model,
+            _user_hf_token(user) if route.requires_hf_token else None,
             reasoning_effort="low",
         )
         llm_params = with_prompt_cache_params(llm_params)

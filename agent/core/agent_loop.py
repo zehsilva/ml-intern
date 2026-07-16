@@ -32,6 +32,7 @@ from agent.core.hf_access import (
     is_inference_billing_error,
 )
 from agent.core.llm_params import _resolve_llm_params
+from agent.core.model_routing import resolve_model_route
 from agent.core.prompt_caching import (
     router_session_id_for,
     with_prompt_cache_params,
@@ -644,6 +645,7 @@ def _friendly_error_message(
     error: Exception,
     *,
     user_plan: str | None = None,
+    model_id: str | None = None,
 ) -> str | None:
     """Return a user-friendly message for known error types, or None to fall back to traceback."""
     err_str = str(error).lower()
@@ -653,6 +655,28 @@ def _friendly_error_message(
         or "unauthorized" in err_str
         or "invalid x-api-key" in err_str
     ):
+        if model_id:
+            try:
+                route = resolve_model_route(model_id)
+            except ValueError:
+                route = None
+            if route and not route.requires_hf_token:
+                env_by_provider = {
+                    "openai": "OPENAI_API_KEY",
+                    "openrouter": "OPENROUTER_API_KEY",
+                    "moonshot": "MOONSHOT_API_KEY",
+                    "gemini": "GEMINI_API_KEY",
+                    "vertex_ai": "Google Application Default Credentials or Vertex AI environment",
+                }
+                credential = env_by_provider.get(
+                    route.provider.value, "the provider API key"
+                )
+                return (
+                    f"Authentication failed for {route.provider.value} model '{model_id}'.\n\n"
+                    f"Set {credential} for this direct provider, or switch models with /model.\n"
+                    "This direct-provider route does not use HF_TOKEN or the Hugging Face Router."
+                )
+
         return (
             "Authentication failed - your Hugging Face token is missing or invalid.\n\n"
             "To fix this, set HF_TOKEN=hf_... or run `hf auth login`.\n\n"
@@ -790,6 +814,7 @@ class LLMResult:
     tool_calls_acc: dict[int, dict]
     token_count: int
     finish_reason: str | None
+    reasoning_content: str | None = None
     usage: dict = field(default_factory=dict)
 
 
@@ -919,19 +944,111 @@ async def _maybe_heal_invalid_thinking_signature(
     return True
 
 
+def _content_to_text(content: Any) -> str | None:
+    """Flatten provider-native content blocks into displayable assistant text."""
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return content or None
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                elif block.get("type") in {"thinking", "redacted_thinking"}:
+                    continue
+                else:
+                    parts.append(json.dumps(block, default=str))
+            else:
+                text = getattr(block, "text", None)
+                if isinstance(text, str):
+                    parts.append(text)
+                else:
+                    parts.append(str(block))
+        text = "\n".join(part for part in parts if part)
+        return text or None
+    return str(content)
+
+
+def _response_output_text(response: Any) -> str | None:
+    """Extract visible text from Responses-API style top-level fields."""
+    output_text = getattr(response, "output_text", None)
+    text = _content_to_text(output_text)
+    if text:
+        return text
+
+    output = getattr(response, "output", None)
+    if not isinstance(output, list):
+        return None
+    parts: list[str] = []
+    for item in output:
+        item_type = (
+            item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+        )
+        if item_type in {"reasoning", "thinking", "redacted_thinking"}:
+            continue
+        content = (
+            item.get("content")
+            if isinstance(item, dict)
+            else getattr(item, "content", None)
+        )
+        text = _content_to_text(content)
+        if text:
+            parts.append(text)
+        elif item_type in {"message", "output_text"}:
+            item_text = (
+                item.get("text")
+                if isinstance(item, dict)
+                else getattr(item, "text", None)
+            )
+            text = _content_to_text(item_text)
+            if text:
+                parts.append(text)
+    joined = "\n".join(parts)
+    return joined or None
+
+
+def _reasoning_from_message(message: Any) -> str | None:
+    value = getattr(message, "reasoning_content", None)
+    if value:
+        return value
+    fields = getattr(message, "provider_specific_fields", None)
+    if isinstance(fields, dict):
+        value = fields.get("reasoning_content") or fields.get("reasoning")
+        if value:
+            return str(value)
+    return None
+
+
+def _reasoning_from_delta(delta: Any) -> str | None:
+    value = getattr(delta, "reasoning_content", None)
+    if value:
+        return value
+    fields = getattr(delta, "provider_specific_fields", None)
+    if isinstance(fields, dict):
+        value = fields.get("reasoning_content") or fields.get("reasoning")
+        if value:
+            return str(value)
+    return None
+
+
 def _assistant_message_from_result(
     llm_result: LLMResult,
     *,
     tool_calls: list[ToolCall] | None = None,
+    model_id: str | None = None,
 ) -> Message:
-    """Build an assistant history message for HF Router-compatible replay."""
-    kwargs: dict[str, Any] = {
-        "role": "assistant",
-        "content": llm_result.content,
-    }
+    """Build an assistant history message with provider-aware reasoning replay."""
+    kwargs: dict[str, Any] = {"role": "assistant", "content": llm_result.content}
     if tool_calls is not None:
         kwargs["tool_calls"] = tool_calls
-    return Message(**kwargs)
+    msg = Message(**kwargs)
+    if model_id and llm_result.reasoning_content:
+        if resolve_model_route(model_id).supports_reasoning_replay:
+            msg.reasoning_content = llm_result.reasoning_content
+    return msg
 
 
 async def _call_llm_streaming(
@@ -950,6 +1067,7 @@ async def _call_llm_streaming(
                 finish_reason=None,
             )
         full_content = ""
+        reasoning_content = ""
         tool_calls_acc: dict[int, dict] = {}
         token_count = 0
         finish_reason = None
@@ -984,21 +1102,34 @@ async def _call_llm_streaming(
                         final_usage_chunk = chunk
                     continue
 
-                delta = choice.delta
+                delta = getattr(choice, "delta", None)
+                message = getattr(choice, "message", None)
                 if choice.finish_reason:
                     finish_reason = choice.finish_reason
 
-                if delta.content:
-                    full_content += delta.content
+                delta_reasoning = (
+                    _reasoning_from_delta(delta) if delta is not None else None
+                )
+                if delta_reasoning:
+                    reasoning_content += delta_reasoning
+
+                delta_text = _content_to_text(getattr(delta, "content", None))
+                if not delta_text:
+                    delta_text = _content_to_text(getattr(message, "content", None))
+                if not delta_text:
+                    delta_text = _response_output_text(chunk)
+                if delta_text:
+                    full_content += delta_text
                     await session.send_event(
                         Event(
                             event_type="assistant_chunk",
-                            data={"content": delta.content},
+                            data={"content": delta_text},
                         )
                     )
 
-                if delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
+                delta_tool_calls = getattr(delta, "tool_calls", None)
+                if delta_tool_calls:
+                    for tc_delta in delta_tool_calls:
                         idx = tc_delta.index
                         if idx not in tool_calls_acc:
                             tool_calls_acc[idx] = {
@@ -1034,6 +1165,7 @@ async def _call_llm_streaming(
                 tool_calls_acc=tool_calls_acc,
                 token_count=token_count,
                 finish_reason=finish_reason,
+                reasoning_content=reasoning_content or None,
                 usage=usage,
             )
         except ContextWindowExceededError:
@@ -1203,7 +1335,8 @@ async def _call_llm_non_streaming(
 
     choice = response.choices[0]
     message = choice.message
-    content = message.content or None
+    content = _content_to_text(message.content) or _response_output_text(response)
+    reasoning_content = _reasoning_from_message(message)
     finish_reason = choice.finish_reason
     token_count = response.usage.total_tokens if response.usage else 0
 
@@ -1239,6 +1372,7 @@ async def _call_llm_non_streaming(
         tool_calls_acc=tool_calls_acc,
         token_count=token_count,
         finish_reason=finish_reason,
+        reasoning_content=reasoning_content,
         usage=usage,
     )
 
@@ -1467,7 +1601,9 @@ class Handlers:
                         "  • For other tools: reduce the size of your arguments or use bash."
                     )
                     if content:
-                        assistant_msg = _assistant_message_from_result(llm_result)
+                        assistant_msg = _assistant_message_from_result(
+                            llm_result, model_id=session.config.model_name
+                        )
                         session.context_manager.add_message(assistant_msg, token_count)
                     session.context_manager.add_message(
                         Message(role="user", content=f"[SYSTEM: {truncation_hint}]")
@@ -1530,7 +1666,9 @@ class Handlers:
                             _NO_TOOL_INCOMPLETE_PLAN_RETRY_LIMIT,
                         )
                         if content:
-                            assistant_msg = _assistant_message_from_result(llm_result)
+                            assistant_msg = _assistant_message_from_result(
+                                llm_result, model_id=session.config.model_name
+                            )
                             session.context_manager.add_message(
                                 assistant_msg, token_count
                             )
@@ -1574,7 +1712,9 @@ class Handlers:
                         (content or "")[:500],
                     )
                     if content:
-                        assistant_msg = _assistant_message_from_result(llm_result)
+                        assistant_msg = _assistant_message_from_result(
+                            llm_result, model_id=session.config.model_name
+                        )
                         session.context_manager.add_message(assistant_msg, token_count)
                         final_response = content
                     if await maybe_pause_yolo_after_spend(
@@ -1619,6 +1759,7 @@ class Handlers:
                 assistant_msg = _assistant_message_from_result(
                     llm_result,
                     tool_calls=tool_calls,
+                    model_id=session.config.model_name,
                 )
                 session.context_manager.add_message(assistant_msg, token_count)
 
@@ -1915,6 +2056,7 @@ class Handlers:
                 error_msg = _friendly_error_message(
                     e,
                     user_plan=getattr(session, "user_plan", None),
+                    model_id=session.config.model_name,
                 )
                 if error_msg is None:
                     error_msg = str(e) + "\n" + traceback.format_exc()
@@ -2671,7 +2813,9 @@ async def submission_loop(
     if config and config.save_sessions:
         Session.retry_failed_uploads_detached(
             directory=str(DEFAULT_SESSION_LOG_DIR),
-            repo_id=config.session_dataset_repo,
+            repo_id=config.session_dataset_repo
+            if getattr(config, "upload_sessions", True)
+            else None,
             personal_repo_id=session._personal_trace_repo_id(),
         )
 
