@@ -1010,6 +1010,33 @@ def _response_output_text(response: Any) -> str | None:
     return joined or None
 
 
+def _responses_stream_event_text(
+    chunk: Any, *, already_received_text: bool
+) -> str | None:
+    """Extract text from raw OpenAI Responses streaming events."""
+    event_type = getattr(chunk, "type", "")
+    if isinstance(chunk, dict):
+        event_type = str(chunk.get("type") or "")
+        delta = chunk.get("delta")
+        text = chunk.get("text")
+        response = chunk.get("response")
+    else:
+        delta = getattr(chunk, "delta", None)
+        text = getattr(chunk, "text", None)
+        response = getattr(chunk, "response", None)
+
+    if event_type.endswith("output_text.delta") or event_type.endswith("text.delta"):
+        return _content_to_text(delta)
+    if event_type.endswith("output_text.done") and not already_received_text:
+        return _content_to_text(text)
+    if (
+        event_type in {"response.completed", "response.done"}
+        and not already_received_text
+    ):
+        return _response_output_text(response or chunk)
+    return None
+
+
 def _reasoning_from_message(message: Any) -> str | None:
     value = getattr(message, "reasoning_content", None)
     if value:
@@ -1095,8 +1122,20 @@ async def _call_llm_streaming(
                     tool_calls_acc.clear()
                     break
 
-                choice = chunk.choices[0] if chunk.choices else None
+                choices = getattr(chunk, "choices", None)
+                choice = choices[0] if choices else None
                 if not choice:
+                    event_text = _responses_stream_event_text(
+                        chunk, already_received_text=bool(full_content)
+                    )
+                    if event_text:
+                        full_content += event_text
+                        await session.send_event(
+                            Event(
+                                event_type="assistant_chunk",
+                                data={"content": event_text},
+                            )
+                        )
                     if hasattr(chunk, "usage") and chunk.usage:
                         token_count = chunk.usage.total_tokens
                         final_usage_chunk = chunk

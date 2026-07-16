@@ -434,3 +434,76 @@ async def test_streaming_call_reads_responses_api_final_message(monkeypatch):
 
     assert result.content == "final visible text"
     assert events[0].data == {"content": "final visible text"}
+
+
+@pytest.mark.asyncio
+async def test_streaming_call_reads_raw_responses_output_text_delta(monkeypatch):
+    async def fake_stream():
+        yield SimpleNamespace(type="response.output_text.delta", delta="raw ")
+        yield SimpleNamespace(type="response.output_text.delta", delta="delta")
+        yield SimpleNamespace(choices=[], usage=SimpleNamespace(total_tokens=3))
+
+    async def fake_acompletion(**_kwargs):
+        return fake_stream()
+
+    events = []
+
+    async def send_event(event):
+        events.append(event)
+
+    session = SimpleNamespace(
+        config=SimpleNamespace(model_name="openai/responses/gpt-5.5"),
+        is_cancelled=False,
+        send_event=send_event,
+    )
+    monkeypatch.setattr("agent.core.agent_loop.acompletion", fake_acompletion)
+
+    result = await _call_llm_streaming(
+        session,
+        messages=[Message(role="user", content="test")],
+        tools=[],
+        llm_params={"model": "openai/responses/gpt-5.5"},
+    )
+
+    assert result.content == "raw delta"
+    assert [
+        event.data for event in events if event.event_type == "assistant_chunk"
+    ] == [
+        {"content": "raw "},
+        {"content": "delta"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_streaming_call_reads_raw_responses_completed_when_no_delta(monkeypatch):
+    async def fake_stream():
+        yield SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(output_text="completed text"),
+        )
+        yield SimpleNamespace(choices=[], usage=SimpleNamespace(total_tokens=3))
+
+    async def fake_acompletion(**_kwargs):
+        return fake_stream()
+
+    events = []
+
+    async def send_event(event):
+        events.append(event)
+
+    session = SimpleNamespace(
+        config=SimpleNamespace(model_name="openai/responses/gpt-5.5"),
+        is_cancelled=False,
+        send_event=send_event,
+    )
+    monkeypatch.setattr("agent.core.agent_loop.acompletion", fake_acompletion)
+
+    result = await _call_llm_streaming(
+        session,
+        messages=[Message(role="user", content="test")],
+        tools=[],
+        llm_params={"model": "openai/responses/gpt-5.5"},
+    )
+
+    assert result.content == "completed text"
+    assert events[0].data == {"content": "completed text"}
