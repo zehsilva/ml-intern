@@ -641,6 +641,32 @@ def _inference_credit_error_message(user_plan: str | None = None) -> str:
     )
 
 
+def _provider_credit_error_message(provider: str, user_plan: str | None = None) -> str:
+    plan = (user_plan or "unknown").lower()
+    provider_label = provider.replace("_", " ").title()
+    credential_env = {
+        "openai": "OPENAI_API_KEY",
+        "openrouter": "OPENROUTER_API_KEY",
+        "moonshot": "MOONSHOT_API_KEY",
+        "gemini": "GEMINI_API_KEY",
+        "vertex_ai": "Google Application Default Credentials or Vertex AI environment",
+    }.get(provider, "the provider API key")
+    if plan == "pro":
+        return (
+            f"{provider_label} credits or quota are exhausted for this account.\n\n"
+            f"Check your {provider_label} billing / quota and verify {credential_env}."
+        )
+    if plan == "free":
+        return (
+            f"Your {provider_label} monthly credits or quota are exhausted.\n\n"
+            f"Check your {provider_label} billing / quota and verify {credential_env}."
+        )
+    return (
+        f"{provider_label} credits or quota appear to be exhausted for this account.\n\n"
+        f"Check your {provider_label} billing / quota and verify {credential_env}."
+    )
+
+
 def _friendly_error_message(
     error: Exception,
     *,
@@ -685,6 +711,13 @@ def _friendly_error_message(
         )
 
     if is_inference_billing_error(error):
+        if model_id:
+            try:
+                route = resolve_model_route(model_id)
+            except ValueError:
+                route = None
+            if route and not route.requires_hf_token:
+                return _provider_credit_error_message(route.provider.value, user_plan)
         return _inference_credit_error_message(user_plan)
 
     if "not supported by provider" in err_str or "no provider supports" in err_str:
@@ -705,7 +738,6 @@ def _friendly_error_message(
         )
 
     return None
-
 
 async def _compact_and_notify(session: Session) -> None:
     """Run compaction and send event if context was reduced.

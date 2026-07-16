@@ -71,7 +71,11 @@ class ModelRoute:
 
     @property
     def supports_reasoning_replay(self) -> bool:
-        return self.provider is ModelProvider.MOONSHOT
+        return self.provider in {
+            ModelProvider.MOONSHOT,
+            ModelProvider.OPENAI,
+            ModelProvider.OPENROUTER,
+        }
 
     @property
     def hf_router_model(self) -> str | None:

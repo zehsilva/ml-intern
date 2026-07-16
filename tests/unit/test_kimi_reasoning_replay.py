@@ -14,7 +14,7 @@ def _tool_call() -> ToolCall:
     )
 
 
-def test_kimi_reasoning_replay_survives_assistant_tool_turn():
+def test_moonshot_reasoning_replay_survives_assistant_tool_turn():
     result = LLMResult(
         content=None,
         tool_calls_acc={
@@ -39,10 +39,50 @@ def test_kimi_reasoning_replay_survives_assistant_tool_turn():
     assert assistant.reasoning_content == "hidden chain state"
 
 
-def test_hf_router_does_not_replay_kimi_reasoning_metadata():
+def test_openai_reasoning_replay_survives_assistant_turn():
+    result = LLMResult(
+        content="done",
+        tool_calls_acc={},
+        token_count=1,
+        finish_reason="stop",
+        reasoning_content="openai hidden chain",
+    )
+
+    assistant = _assistant_message_from_result(
+        result,
+        model_id="openai/responses/gpt-5.6",
+    )
+
+    assert assistant.reasoning_content == "openai hidden chain"
+
+
+def test_openrouter_reasoning_replay_survives_assistant_turn():
+    result = LLMResult(
+        content="done",
+        tool_calls_acc={},
+        token_count=1,
+        finish_reason="stop",
+        reasoning_content="openrouter hidden chain",
+    )
+
+    assistant = _assistant_message_from_result(
+        result,
+        model_id="openrouter/openai/gpt-4o",
+    )
+
+    assert assistant.reasoning_content == "openrouter hidden chain"
+
+
+def test_hf_router_does_not_replay_reasoning_metadata():
     result = LLMResult(
         content=None,
-        tool_calls_acc={},
+        tool_calls_acc={
+            0: {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read", "arguments": "{}"},
+            }
+        },
         token_count=1,
         finish_reason="stop",
         reasoning_content="must not be sent to router",
@@ -56,7 +96,7 @@ def test_hf_router_does_not_replay_kimi_reasoning_metadata():
     assert getattr(assistant, "reasoning_content", None) is None
 
 
-def test_research_subagent_replays_reasoning_only_for_moonshot():
+def test_research_subagent_replays_reasoning_for_supported_providers():
     msg = SimpleNamespace(
         content=None,
         tool_calls=[_tool_call()],
@@ -65,9 +105,13 @@ def test_research_subagent_replays_reasoning_only_for_moonshot():
     )
 
     kimi_msg = _assistant_message_for_replay("moonshot/kimi-k2.7-code-highspeed", msg)
+    openai_msg = _assistant_message_for_replay("openai/responses/gpt-5.6", msg)
+    openrouter_msg = _assistant_message_for_replay("openrouter/openai/gpt-4o", msg)
     hf_msg = _assistant_message_for_replay(
         "huggingface/moonshotai/Kimi-K2.7-Code:novita", msg
     )
 
     assert kimi_msg.reasoning_content == "research hidden state"
+    assert openai_msg.reasoning_content == "research hidden state"
+    assert openrouter_msg.reasoning_content == "research hidden state"
     assert getattr(hf_msg, "reasoning_content", None) is None

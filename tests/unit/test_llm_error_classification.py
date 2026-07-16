@@ -136,3 +136,16 @@ def test_unknown_plan_credit_error_uses_fallback_wording():
     assert "If this is a free account" in msg
     assert "https://huggingface.co/settings/billing" in msg
     assert "https://huggingface.co/subscribe/pro" in msg
+
+
+def test_moonshot_credit_error_uses_direct_provider_wording():
+    msg = _friendly_error_message(
+        Exception("monthly credits exhausted"),
+        user_plan="free",
+        model_id="moonshot/kimi-k2.7-code-highspeed",
+    )
+
+    assert msg is not None
+    assert "Moonshot" in msg
+    assert "MOONSHOT_API_KEY" in msg
+    assert "Hugging Face" not in msg

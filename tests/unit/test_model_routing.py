@@ -44,8 +44,10 @@ def test_direct_provider_routes():
         resolve_model_route("openrouter/anthropic/claude-sonnet-4").provider
         is ModelProvider.OPENROUTER
     )
+    assert resolve_model_route("moonshot/kimi-k2.7-code-highspeed").supports_reasoning_replay
+    assert resolve_model_route("openai/gpt-5.5").supports_reasoning_replay
     assert resolve_model_route(
-        "moonshot/kimi-k2.7-code-highspeed"
+        "openrouter/anthropic/claude-sonnet-4"
     ).supports_reasoning_replay
     assert resolve_model_route("gemini/gemini-2.5-pro").provider is ModelProvider.GEMINI
     assert (
