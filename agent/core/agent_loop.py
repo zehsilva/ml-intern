@@ -972,6 +972,44 @@ def _content_to_text(content: Any) -> str | None:
     return str(content)
 
 
+def _response_output_text(response: Any) -> str | None:
+    """Extract visible text from Responses-API style top-level fields."""
+    output_text = getattr(response, "output_text", None)
+    text = _content_to_text(output_text)
+    if text:
+        return text
+
+    output = getattr(response, "output", None)
+    if not isinstance(output, list):
+        return None
+    parts: list[str] = []
+    for item in output:
+        item_type = (
+            item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+        )
+        if item_type in {"reasoning", "thinking", "redacted_thinking"}:
+            continue
+        content = (
+            item.get("content")
+            if isinstance(item, dict)
+            else getattr(item, "content", None)
+        )
+        text = _content_to_text(content)
+        if text:
+            parts.append(text)
+        elif item_type in {"message", "output_text"}:
+            item_text = (
+                item.get("text")
+                if isinstance(item, dict)
+                else getattr(item, "text", None)
+            )
+            text = _content_to_text(item_text)
+            if text:
+                parts.append(text)
+    joined = "\n".join(parts)
+    return joined or None
+
+
 def _reasoning_from_message(message: Any) -> str | None:
     value = getattr(message, "reasoning_content", None)
     if value:
@@ -1064,15 +1102,22 @@ async def _call_llm_streaming(
                         final_usage_chunk = chunk
                     continue
 
-                delta = choice.delta
+                delta = getattr(choice, "delta", None)
+                message = getattr(choice, "message", None)
                 if choice.finish_reason:
                     finish_reason = choice.finish_reason
 
-                delta_reasoning = _reasoning_from_delta(delta)
+                delta_reasoning = (
+                    _reasoning_from_delta(delta) if delta is not None else None
+                )
                 if delta_reasoning:
                     reasoning_content += delta_reasoning
 
                 delta_text = _content_to_text(getattr(delta, "content", None))
+                if not delta_text:
+                    delta_text = _content_to_text(getattr(message, "content", None))
+                if not delta_text:
+                    delta_text = _response_output_text(chunk)
                 if delta_text:
                     full_content += delta_text
                     await session.send_event(
@@ -1082,8 +1127,9 @@ async def _call_llm_streaming(
                         )
                     )
 
-                if delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
+                delta_tool_calls = getattr(delta, "tool_calls", None)
+                if delta_tool_calls:
+                    for tc_delta in delta_tool_calls:
                         idx = tc_delta.index
                         if idx not in tool_calls_acc:
                             tool_calls_acc[idx] = {
@@ -1289,7 +1335,7 @@ async def _call_llm_non_streaming(
 
     choice = response.choices[0]
     message = choice.message
-    content = _content_to_text(message.content)
+    content = _content_to_text(message.content) or _response_output_text(response)
     reasoning_content = _reasoning_from_message(message)
     finish_reason = choice.finish_reason
     token_count = response.usage.total_tokens if response.usage else 0

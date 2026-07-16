@@ -1468,7 +1468,7 @@ async def headless_main(
         )
         sys.exit(1)
 
-    if hf_token:
+    if hf_token and needs_hf_token:
         print("HF token loaded", file=sys.stderr)
 
     notification_gateway = NotificationGateway(config.messaging)
