@@ -2,7 +2,11 @@
 HF Agent - Main agent module
 """
 
-import litellm
+import warnings
+
+warnings.filterwarnings("ignore", category=SyntaxWarning, module=r"whoosh(\.|$)")
+
+import litellm  # noqa: E402
 
 # Global LiteLLM behavior — set once at package import so both CLI and
 # backend entries share the same config.
